@@ -1,0 +1,171 @@
+# =========================
+# Z-score 归一化 + 按目标分箱分层的 Train / Val / Test
+# =========================
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+
+# =========================
+# 1. 读取数据
+# =========================
+data = pd.read_excel('data/Unfiltered.xlsx')
+
+formulas = data['formula'].values
+
+df = data.loc[:, [
+    'Type', 'MPA', 'MPB', 'rA', 'rB',
+    'IA', 'IB', 'XA', 'XB',
+    'MA', 'MB', 'IA2', 'IB2',
+    'XA2', 'XB2', 'Co', 'Fe',
+    'rAB', 'Rp'
+]].copy()
+
+# =========================
+# ★ 2. 构造 Rp 分箱（仅用于分层）
+# =========================
+# 自然分箱：≤1, 1–2, >2
+rp = df['Rp'].values
+rp_bins = pd.cut(
+    rp,
+    bins=[-np.inf, 1.0, 2.0, np.inf],
+    labels=[0, 1, 2]
+)
+
+# =========================
+# ★ 3. 第一次分层拆分：Test (20%)
+# =========================
+remain_data, test_data, \
+remain_formula, test_formula, \
+remain_bins, test_bins = train_test_split(
+    df,
+    formulas,
+    rp_bins,
+    test_size=0.2,
+    random_state=42,
+    stratify=rp_bins
+)
+
+# =========================
+# ★ 4. 第二次分层拆分：Val (10%) + Train (70%)
+# =========================
+val_relative_size = 0.1 / 0.8  # 0.125
+
+train_data, val_data, \
+train_formula, val_formula, \
+train_bins, val_bins = train_test_split(
+    remain_data,
+    remain_formula,
+    remain_bins,
+    test_size=val_relative_size,
+    random_state=42,
+    stratify=remain_bins
+)
+
+# 命名保持与你原代码一致
+TrainData, ValData, TestData = train_data, val_data, test_data
+Train_formula, Val_formula, Test_formula = train_formula, val_formula, test_formula
+
+print("数据划分完成（按 Rp 分箱分层）：")
+print(f"Train: {len(TrainData)} | Val: {len(ValData)} | Test: {len(TestData)}")
+
+# =========================
+# 5. Z-score（仅在训练集 fit）
+# =========================
+scaler = StandardScaler()
+TrainData_scaled = scaler.fit_transform(TrainData)
+ValData_scaled   = scaler.transform(ValData)
+TestData_scaled  = scaler.transform(TestData)
+
+TrainData_scaled = pd.DataFrame(TrainData_scaled, columns=df.columns)
+ValData_scaled   = pd.DataFrame(ValData_scaled, columns=df.columns)
+TestData_scaled  = pd.DataFrame(TestData_scaled, columns=df.columns)
+
+# =========================
+# 6. X / y
+# =========================
+Train_X = TrainData_scaled.iloc[:, :18]
+Train_y = TrainData_scaled.iloc[:, 18]
+
+Val_X   = ValData_scaled.iloc[:, :18]
+Val_y   = ValData_scaled.iloc[:, 18]
+
+Test_X  = TestData_scaled.iloc[:, :18]
+Test_y  = TestData_scaled.iloc[:, 18]
+
+# =========================
+# 7. XGBoost
+# =========================
+model = XGBRegressor(
+    objective='reg:squarederror',
+    random_state=42,
+    n_estimators=100,
+    max_depth=3,
+    learning_rate=0.1
+)
+model.fit(Train_X, Train_y)
+
+# =========================
+# 8. 预测
+# =========================
+Train_pred_scaled = model.predict(Train_X)
+Val_pred_scaled   = model.predict(Val_X)
+Test_pred_scaled  = model.predict(Test_X)
+
+# =========================
+# 9. Rp 反归一化
+# =========================
+def inverse_transform_rp(y_scaled, scaler, rp_index=18):
+    tmp = np.zeros((len(y_scaled), scaler.n_features_in_))
+    tmp[:, rp_index] = y_scaled
+    return scaler.inverse_transform(tmp)[:, rp_index]
+
+Train_y_real = inverse_transform_rp(Train_y.values, scaler)
+Train_pred_real = inverse_transform_rp(Train_pred_scaled, scaler)
+
+Val_y_real = inverse_transform_rp(Val_y.values, scaler)
+Val_pred_real = inverse_transform_rp(Val_pred_scaled, scaler)
+
+Test_y_real = inverse_transform_rp(Test_y.values, scaler)
+Test_pred_real = inverse_transform_rp(Test_pred_scaled, scaler)
+
+# =========================
+# 10. 评估
+# =========================
+def evaluate(name, y_true, y_pred):
+    print(f"\n{name} 评估：")
+    print(f"MSE : {mean_squared_error(y_true, y_pred):.4f}")
+    print(f"RMSE: {np.sqrt(mean_squared_error(y_true, y_pred)):.4f}")
+    print(f"MAE : {mean_absolute_error(y_true, y_pred):.4f}")
+    print(f"R²  : {r2_score(y_true, y_pred):.4f}")
+
+evaluate("Train", Train_y_real, Train_pred_real)
+evaluate("Val",   Val_y_real,   Val_pred_real)
+evaluate("Test",  Test_y_real,  Test_pred_real)
+
+# =========================
+# 11. 逐样本误差导出
+# =========================
+def build_error_df(formula, y_true, y_pred, name):
+    df_e = pd.DataFrame({
+        'formula': formula,
+        'y_true': y_true,
+        'y_pred': y_pred
+    })
+    df_e['error'] = df_e['y_pred'] - df_e['y_true']
+    df_e['abs_error'] = np.abs(df_e['error'])
+    df_e['dataset'] = name
+    return df_e
+
+train_df = build_error_df(Train_formula, Train_y_real, Train_pred_real, 'Train')
+val_df   = build_error_df(Val_formula,   Val_y_real,   Val_pred_real,   'Val')
+test_df  = build_error_df(Test_formula,  Test_y_real,  Test_pred_real,  'Test')
+
+with pd.ExcelWriter('XGBoost_error_analysis_stratified.xlsx') as writer:
+    train_df.to_excel(writer, sheet_name='Train', index=False)
+    val_df.to_excel(writer,   sheet_name='Val',   index=False)
+    test_df.to_excel(writer,  sheet_name='Test',  index=False)
+
+print("\n误差分析文件已导出（按 Rp 分箱分层）")
