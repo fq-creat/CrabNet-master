@@ -83,7 +83,7 @@ def get_model(data_dir, mat_prop, classification=False, batch_size=None,
     # data_size = pd.read_csv(train_data).shape[0]
     # batch_size = 2 ** round(np.log2(data_size) - 4)
     # batch_size = max(2 ** 7, min(batch_size, 2 ** 12))  # 简化边界判断
-    FIXED_BATCH_SIZE =128
+    FIXED_BATCH_SIZE =1
     batch_size = FIXED_BATCH_SIZE
     # 加载训练数据
     model.load_data(train_data, batch_size=batch_size, train=True)
@@ -155,7 +155,7 @@ def load_model(data_dir, mat_prop, classification, file_name, verbose=True):
 
     # 加载待预测数据
     data = f'{data_dir}/{mat_prop}/{file_name}'
-    model.load_data(data, batch_size=128, train=False)
+    model.load_data(data, batch_size=1, train=False)
     return model
 
 
@@ -202,6 +202,80 @@ def save_results(data_dir, mat_prop, classification, file_name, verbose=True):
     split_name = file_name.replace(".csv", "")
     save_prediction_excel(output, mat_prop, split_name)
     return model, metrics
+def save_encoder_embeddings_csv(data_dir, mat_prop, classification, file_name,
+                                pooling='frac_weighted', verbose=True):
+    model = load_model(data_dir, mat_prop, classification, file_name, verbose=verbose)
+    model.model.eval()
+
+    all_formulae = []
+    all_targets = []
+    all_embeddings = []
+
+    with torch.no_grad():
+        for data in model.data_loader:
+            X, y, formula = data
+            src, frac = X.squeeze(-1).chunk(2, dim=1)
+
+            src = src.to(model.compute_device, dtype=torch.long, non_blocking=True)
+            frac = frac.to(model.compute_device, dtype=torch.float32, non_blocking=True)
+
+            # element-level encoder 输出: [batch, n_elements, d_model]
+            elem_emb = model.model.encoder(src, frac)
+            valid_mask = (src != 0).float()
+
+            if pooling == 'frac_weighted':
+                # 按元素分数做 composition 聚合
+                weights = frac * valid_mask
+                denom = weights.sum(dim=1, keepdim=True).clamp(min=1e-12)
+                weights = weights / denom
+                comp_emb = (elem_emb * weights.unsqueeze(-1)).sum(dim=1)
+            elif pooling == 'mean':
+                # 仅对有效元素位点平均
+                denom = valid_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+                comp_emb = (elem_emb * valid_mask.unsqueeze(-1)).sum(dim=1) / denom
+            else:
+                raise ValueError("pooling 必须是 'frac_weighted' 或 'mean'")
+
+            all_embeddings.append(comp_emb.cpu().numpy())
+            all_formulae.extend(list(formula))
+            all_targets.extend(y.view(-1).cpu().numpy().astype('float32').tolist())
+
+    embeddings = np.vstack(all_embeddings)
+    emb_cols = [f'emb_{i}' for i in range(embeddings.shape[1])]
+    df = pd.DataFrame(embeddings, columns=emb_cols)
+    df.insert(0, 'formula', all_formulae)
+    df.insert(1, 'target', all_targets)
+
+    save_dir = 'model_embeddings'
+    os.makedirs(save_dir, exist_ok=True)
+    split_name = file_name.replace('.csv', '')
+    save_path = os.path.join(save_dir, f'{mat_prop}_{split_name}_encoder_{pooling}.csv')
+    df.to_csv(save_path, index=False)
+
+    print(f'✅ 已保存 {split_name} 的 encoder 向量到: {save_path}')
+    return save_path
+
+
+def merge_embedding_csvs_to_excel(csv_paths, mat_prop, pooling='frac_weighted'):
+
+    merged_parts = []
+    for csv_path in csv_paths:
+        df = pd.read_csv(csv_path)
+        merged_parts.append(df)
+
+    merged_df = pd.concat(merged_parts, ignore_index=True)
+
+    save_dir = 'model_embeddings'
+    os.makedirs(save_dir, exist_ok=True)
+    merged_csv_path = os.path.join(save_dir, f'{mat_prop}_all_encoder_{pooling}.csv')
+    merged_xlsx_path = os.path.join(save_dir, f'{mat_prop}_all_encoder_{pooling}.xlsx')
+
+    merged_df.to_csv(merged_csv_path, index=False)
+    merged_df.to_excel(merged_xlsx_path, index=False)
+
+    print(f'✅ 已合并并保存 CSV: {merged_csv_path}')
+    print(f'✅ 已转换并保存 Excel: {merged_xlsx_path}')
+    return merged_csv_path, merged_xlsx_path
 
 
 def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
@@ -267,7 +341,7 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
 # 主程序
 # ===============================
 if __name__ == '__main__':
-    excel_path = 'Unfiltered.xlsx'  # 输入Excel文件路径
+    excel_path = 'filtered.xlsx'  # 输入Excel文件路径
     mat_prop = 'example_materials_property'  # 材料属性名称
     classification = False  # 是否为分类任务（False=回归，True=分类）
     train = True  # 是否训练模型
@@ -305,3 +379,16 @@ if __name__ == '__main__':
     print('\n测试集性能:')
     model_test, metrics_test = save_results(data_dir, mat_prop, classification,
                                             'test.csv', verbose=False)
+    print('\n导出 encoder composition 向量:')
+    train_emb_csv = save_encoder_embeddings_csv(data_dir, mat_prop, classification,
+                                                'train.csv', pooling='frac_weighted', verbose=False)
+    val_emb_csv = save_encoder_embeddings_csv(data_dir, mat_prop, classification,
+                                              'val.csv', pooling='frac_weighted', verbose=False)
+    test_emb_csv = save_encoder_embeddings_csv(data_dir, mat_prop, classification,
+                                               'test.csv', pooling='frac_weighted', verbose=False)
+
+    # 合并 train/val/test 三个 embedding CSV，并导出为 Excel
+    print('\n合并 embedding CSV 并导出 Excel:')
+    merge_embedding_csvs_to_excel([train_emb_csv, val_emb_csv, test_emb_csv],
+                                  mat_prop,
+                                  pooling='frac_weighted')
