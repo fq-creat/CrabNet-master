@@ -1,24 +1,22 @@
 import os
 import re
-import sys
-import argparse
 import numpy as np
 import pandas as pd
 import torch
+import sys
+
+#from MAT2VEC import embedding_dict
+
+sys.path.append("./CrabNet")  # 或者 "./CrabNet/crabnet" 取决于你的结构
 
 from sklearn.metrics import roc_auc_score, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
-
-sys.path.append("./CrabNet")  # 保持与你当前工程一致
 
 from crabnet.kingcrab import CrabNet
 from crabnet.model import Model
 from utils.get_compute_device import get_compute_device
 
-
-# ===============================
 # 全局设置
-# ===============================
 compute_device = get_compute_device(prefer_last=True)
 RNG_SEED = 42
 torch.manual_seed(RNG_SEED)
@@ -26,130 +24,107 @@ np.random.seed(RNG_SEED)
 
 
 # ===============================
-# 工具函数
+# 替换后的化学式分数转小数核心函数（更健壮）
 # ===============================
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    v = v.lower()
-    if v in ("yes", "true", "t", "1", "y"):
-        return True
-    if v in ("no", "false", "f", "0", "n"):
-        return False
-    raise argparse.ArgumentTypeError("布尔参数请使用 true/false")
-
-
 def frac_to_decimal_in_formula(formula, ndigits=2):
-    """将化学式中的分数字符串替换为小数（例如 O1/2 -> O0.5）。"""
     if not isinstance(formula, str):
         return formula
 
+    # 正则匹配规则：匹配 "元素符号 + 分子 / 分母" 的模式（允许分子分母间有空格）
+    # 例如：O1/2、Fe3/4、O 1 / 2 都会被正确匹配
     pattern = r'([A-Z][a-z]?)(\d+)\s*/\s*(\d+)'
 
     def repl(m):
+        """正则替换函数：计算分数值并保留指定位数"""
         element = m.group(1)
-        numerator = float(m.group(2))
-        denominator = float(m.group(3))
+        numerator = float(m.group(2))  # 分子
+        denominator = float(m.group(3))  # 分母
         decimal_val = round(numerator / denominator, ndigits)
+        # 避免出现如 0.50 这样的末尾零，简化为 0.5
         decimal_str = f"{decimal_val:.{ndigits}f}".rstrip('0').rstrip('.')
         return f"{element}{decimal_str}"
 
+    # 执行正则替换
     processed_formula = re.sub(pattern, repl, formula)
+    # 额外清理可能的多余空格（兜底处理）
     processed_formula = re.sub(r'\s+', '', processed_formula)
     return processed_formula
 
 
 # ===============================
-# 模型相关函数
+# 原有核心功能函数（仅调整化学式处理调用）
 # ===============================
 def get_model(data_dir, mat_prop, classification=False, batch_size=None,
-              transfer=None, verbose=True, epochs=500):
-    """加载并训练 CrabNet。"""
-    model = Model(
-        CrabNet(compute_device=compute_device).to(compute_device),
-        model_name=f'{mat_prop}',
-        verbose=verbose
-    )
+              transfer=None, verbose=True):
+    # 加载CrabNet模型架构
+    model = Model(CrabNet(compute_device=compute_device).to(compute_device),
+                  model_name=f'{mat_prop}', verbose=verbose)
 
+    # 加载预训练权重（如有）
     if transfer is not None:
         model.load_network(f'{transfer}.pth')
         model.model_name = f'{mat_prop}'
 
+    # 分类任务设置
     if classification:
         model.classification = True
 
+    # 加载训练和验证数据路径
     train_data = f'{data_dir}/{mat_prop}/train.csv'
     val_data = f'{data_dir}/{mat_prop}/val.csv'
 
-    if not os.path.exists(train_data):
-        raise FileNotFoundError(f'训练集文件不存在: {train_data}')
+    # 检查验证集是否存在（修正原代码异常捕获无效的问题）
     if not os.path.exists(val_data):
-        raise FileNotFoundError(f'验证集文件不存在: {val_data}')
+        raise FileNotFoundError(
+            f'验证集文件不存在！请确保 {data_dir}/{mat_prop} 目录下有 val.csv 文件'
+        )
 
-    if batch_size is None:
-        # 与你原脚本保持一致：固定 batch_size=1
-        # 如果你想加速，可改成动态策略
-        batch_size = 16
-
+    # 计算合理的batch size
+    # data_size = pd.read_csv(train_data).shape[0]
+    # batch_size = 2 ** round(np.log2(data_size) - 4)
+    # batch_size = max(2 ** 7, min(batch_size, 2 ** 12))  # 简化边界判断
+    FIXED_BATCH_SIZE =128
+    batch_size = FIXED_BATCH_SIZE
+    # 加载训练数据
     model.load_data(train_data, batch_size=batch_size, train=True)
     print(f'training with batchsize {model.batch_size} '
           f'(2**{np.log2(model.batch_size):0.3f})')
+    # 加载验证数据
     model.load_data(val_data, batch_size=batch_size)
 
-    model.fit(epochs=epochs, losscurve=False)
+    # 训练模型
+    model.fit(epochs=500, losscurve=False)
+    # 保存模型
     model.save_network()
     return model
 
 
-def load_model(data_dir, mat_prop, classification, file_name, verbose=True):
-    """加载已保存模型并读取预测数据。"""
-    model = Model(
-        CrabNet(compute_device=compute_device).to(compute_device),
-        model_name=f'{mat_prop}',
-        verbose=verbose
-    )
-    model.load_network(f'{mat_prop}.pth')
-
-    if classification:
-        model.classification = True
-
-    data = f'{data_dir}/{mat_prop}/{file_name}'
-    if not os.path.exists(data):
-        raise FileNotFoundError(f'数据文件不存在: {data}')
-
-    model.load_data(data, batch_size=16, train=False)
-    return model
-
-
-def get_results(model):
-    output = model.predict(model.data_loader)
-    return model, output
-
-
-def to_csv(output, save_name):
-    act, pred, formulae, uncertainty = output
-    df = pd.DataFrame([formulae, act, pred, uncertainty]).T
-    df.columns = ['composition', 'target', 'pred-0', 'uncertainty']
-    save_path = 'model_predictions'
-    os.makedirs(save_path, exist_ok=True)
-    df.to_csv(f'{save_path}/{save_name}', index_label='Index')
-
-
 def save_prediction_excel(output, mat_prop, split_name):
+    import os
+    from pathlib import Path
+
+    # 解析模型输出
     y_true, y_pred, formulae, _ = output
+
+    # 构建结果DataFrame
     df = pd.DataFrame({
         "formula": formulae,
         "y_true": y_true,
         "y_pred": y_pred,
     })
+    # 计算误差列
     df["error"] = df["y_pred"] - df["y_true"]
     df["abs_error"] = df["error"].abs()
+    # 标记数据集类型
     df["dataset"] = split_name
 
-    save_dir = "model_predictions_excel"
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"{mat_prop}_predictions.xlsx")
+    # 创建保存目录
+    save_dir = Path("model_predictions_excel")
+    save_dir.mkdir(exist_ok=True)
+    # 保存Excel文件（每个模型一个文件，包含所有数据集结果）
+    save_path = save_dir / f"{mat_prop}_predictions.xlsx"
 
+    # 若文件已存在（比如先存了train，再存val/test），追加到同一个文件的不同sheet
     if os.path.exists(save_path):
         with pd.ExcelWriter(save_path, mode="a", engine="openpyxl", if_sheet_exists="replace") as writer:
             df.to_excel(writer, sheet_name=split_name, index=False)
@@ -158,25 +133,60 @@ def save_prediction_excel(output, mat_prop, split_name):
             df.to_excel(writer, sheet_name=split_name, index=False)
 
     print(f"✅ {split_name}集预测结果已保存到Excel: {save_path} (sheet: {split_name})")
+def to_csv(output, save_name):
+    # 解析预测结果并保存为CSV
+    act, pred, formulae, uncertainty = output
+    df = pd.DataFrame([formulae, act, pred, uncertainty]).T
+    df.columns = ['composition', 'target', 'pred-0', 'uncertainty']
+    save_path = 'model_predictions'
+    os.makedirs(save_path, exist_ok=True)
+    df.to_csv(f'{save_path}/{save_name}', index_label='Index')
+
+
+def load_model(data_dir, mat_prop, classification, file_name, verbose=True):
+    # 加载已保存的模型
+    model = Model(CrabNet(compute_device=compute_device).to(compute_device),
+                  model_name=f'{mat_prop}', verbose=verbose)
+    model.load_network(f'{mat_prop}.pth')
+
+    # 分类任务设置
+    if classification:
+        model.classification = True
+
+    # 加载待预测数据
+    data = f'{data_dir}/{mat_prop}/{file_name}'
+    model.load_data(data, batch_size=128, train=False)
+    return model
+
+
+def get_results(model):
+    # 执行预测并返回结果
+    output = model.predict(model.data_loader)
+    return model, output
 
 
 def save_results(data_dir, mat_prop, classification, file_name, verbose=True):
+    # 加载模型并计算评估指标
     model = load_model(data_dir, mat_prop, classification, file_name, verbose=verbose)
     model, output = get_results(model)
 
+    # 获取真实值和预测值
     y_true = output[0]
     y_pred = output[1]
 
+    # 根据任务类型计算指标
     if model.classification:
         auc = roc_auc_score(y_true, y_pred)
         print(f'{mat_prop} ROC AUC: {auc:0.3f}')
         metrics = {'auc': auc}
     else:
+        # 回归任务指标计算
         mae = np.abs(y_true - y_pred).mean()
         mse = mean_squared_error(y_true, y_pred)
         rmse = np.sqrt(mse)
         r2 = r2_score(y_true, y_pred)
 
+        # 打印指标
         print(f'{mat_prop} 数据集: {file_name}')
         print(f'  MAE:  {mae:0.4f}')
         print(f'  MSE:  {mse:0.4f}')
@@ -186,21 +196,14 @@ def save_results(data_dir, mat_prop, classification, file_name, verbose=True):
 
         metrics = {'mae': mae, 'mse': mse, 'rmse': rmse, 'r2': r2}
 
+    # 保存预测结果
     fname = f'{mat_prop}_{file_name.replace(".csv", "")}_output.csv'
     to_csv(output, fname)
     split_name = file_name.replace(".csv", "")
     save_prediction_excel(output, mat_prop, split_name)
     return model, metrics
-
-
 def save_encoder_embeddings_csv(data_dir, mat_prop, classification, file_name,
                                 pooling='frac_weighted', verbose=True):
-    """
-    导出 encoder composition 向量（不是 output_nn 后的向量）。
-    pooling:
-      - 'frac_weighted': 按元素分数加权平均
-      - 'mean': 有效元素位点均值
-    """
     model = load_model(data_dir, mat_prop, classification, file_name, verbose=verbose)
     model.model.eval()
 
@@ -221,11 +224,13 @@ def save_encoder_embeddings_csv(data_dir, mat_prop, classification, file_name,
             valid_mask = (src != 0).float()
 
             if pooling == 'frac_weighted':
+                # 按元素分数做 composition 聚合
                 weights = frac * valid_mask
                 denom = weights.sum(dim=1, keepdim=True).clamp(min=1e-12)
                 weights = weights / denom
                 comp_emb = (elem_emb * weights.unsqueeze(-1)).sum(dim=1)
             elif pooling == 'mean':
+                # 仅对有效元素位点平均
                 denom = valid_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
                 comp_emb = (elem_emb * valid_mask.unsqueeze(-1)).sum(dim=1) / denom
             else:
@@ -252,6 +257,7 @@ def save_encoder_embeddings_csv(data_dir, mat_prop, classification, file_name,
 
 
 def merge_embedding_csvs_to_excel(csv_paths, mat_prop, pooling='frac_weighted'):
+
     merged_parts = []
     for csv_path in csv_paths:
         df = pd.read_csv(csv_path)
@@ -272,18 +278,11 @@ def merge_embedding_csvs_to_excel(csv_paths, mat_prop, pooling='frac_weighted'):
     return merged_csv_path, merged_xlsx_path
 
 
-# ===============================
-# 数据准备函数（Excel模式）
-# ===============================
 def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
-    """
-    预处理 Excel：
-    - 清洗化学式
-    - 分层划分 train/val/test
-    - 保存到 data/<mat_prop>/{train,val,test}.csv
-    """
+    # 预处理Excel数据：清洗化学式 + 按目标分箱分层划分数据集 + 保存为CSV
     df = pd.read_excel(excel_path, sheet_name=0)
 
+    # ========== 化学式清洗 ==========
     df['formula'] = (
         df['formula']
         .astype(str)
@@ -291,16 +290,27 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
         .apply(frac_to_decimal_in_formula)
     )
 
+    # ========== 目标列 ==========
     target_col = df.columns[1]
 
-    # 分箱分层（回归任务常见技巧）
+    # ========== 按目标分箱（只用于分层） ==========
     bins = [0, 1.0, 2.0, np.inf]
-    df["y_bin"] = pd.cut(df[target_col], bins=bins, labels=[0, 1, 2], include_lowest=True)
-
-    train_val_df, test_df = train_test_split(
-        df, test_size=test_size, random_state=RNG_SEED, stratify=df["y_bin"]
+    df["y_bin"] = pd.cut(
+        df[target_col],
+        bins=bins,
+        labels=[0, 1, 2],
+        include_lowest=True
     )
 
+    # ========== 第一次切分：train_val / test（分层） ==========
+    train_val_df, test_df = train_test_split(
+        df,
+        test_size=test_size,
+        random_state=RNG_SEED,
+        stratify=df["y_bin"]
+    )
+
+    # ========== 第二次切分：train / val（分层） ==========
     val_relative_size = val_size / (1 - test_size)
     train_df, val_df = train_test_split(
         train_val_df,
@@ -309,194 +319,76 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
         stratify=train_val_df["y_bin"]
     )
 
+    # ========== 删除临时分箱列 ==========
     for split_df in [train_df, val_df, test_df]:
         split_df.drop(columns=["y_bin"], inplace=True)
 
-    # 统一列名为 formula/target（与 CrabNet 习惯一致）
-    train_df = train_df.rename(columns={target_col: "target"})
-    val_df = val_df.rename(columns={target_col: "target"})
-    test_df = test_df.rename(columns={target_col: "target"})
-
+    # ========== 创建保存目录 ==========
     base_dir = 'data'
     prop_dir = os.path.join(base_dir, mat_prop)
     os.makedirs(prop_dir, exist_ok=True)
 
-    train_df[['formula', 'target']].to_csv(os.path.join(prop_dir, 'train.csv'), index=False)
-    val_df[['formula', 'target']].to_csv(os.path.join(prop_dir, 'val.csv'), index=False)
-    test_df[['formula', 'target']].to_csv(os.path.join(prop_dir, 'test.csv'), index=False)
+    # ========== 保存CSV ==========
+    train_df.to_csv(os.path.join(prop_dir, 'train.csv'), index=False)
+    val_df.to_csv(os.path.join(prop_dir, 'val.csv'), index=False)
+    test_df.to_csv(os.path.join(prop_dir, 'test.csv'), index=False)
 
     return base_dir, mat_prop
 
-
-# ===============================
-# 数据准备函数（Matbench模式）
-# ===============================
-def prepare_matbench_task_to_csv(matbench_task='matbench_perovskites',
-                                 mat_prop='castelli',
-                                 fold=0,
-                                 val_size=0.1,
-                                 seed=42):
-    """
-    从 Matbench 指定任务读取一个 fold，保存为:
-      data/<mat_prop>/train.csv
-      data/<mat_prop>/val.csv
-      data/<mat_prop>/test.csv
-
-    说明：
-    - matbench 提供的是 train+val 与 test；
-    - 这里把 train+val 再切分一部分做 val（便于与你现有训练流程兼容）。
-    """
-    try:
-        from matbench.bench import MatbenchBenchmark
-    except Exception as e:
-        raise ImportError(
-            "未安装 matbench，请先安装：pip install matbench"
-        ) from e
-
-    mb = MatbenchBenchmark(subset=[matbench_task], autoload=False)
-    if len(mb.tasks) == 0:
-        raise ValueError(f'未找到 Matbench 任务: {matbench_task}')
-
-    task = mb.tasks[0]
-    task.load()
-
-    X_trainval, y_trainval = task.get_train_and_val_data(fold)
-    X_test, y_test = task.get_test_data(fold, include_target=True)
-
-    # 某些任务返回的是 Composition 对象，统一转字符串
-    df_trainval = pd.DataFrame({
-        'formula': pd.Series(X_trainval).astype(str).values,
-        'target': pd.Series(y_trainval).values
-    })
-    df_test = pd.DataFrame({
-        'formula': pd.Series(X_test).astype(str).values,
-        'target': pd.Series(y_test).values
-    })
-
-    # 清洗化学式（与 Excel 流程保持一致）
-    df_trainval['formula'] = (
-        df_trainval['formula'].astype(str).str.replace(r'\s+|\u200b', '', regex=True).apply(frac_to_decimal_in_formula)
-    )
-    df_test['formula'] = (
-        df_test['formula'].astype(str).str.replace(r'\s+|\u200b', '', regex=True).apply(frac_to_decimal_in_formula)
-    )
-
-    # 回归任务默认非分层；如需分层可加分箱逻辑
-    df_train, df_val = train_test_split(
-        df_trainval, test_size=val_size, random_state=seed
-    )
-
-    base_dir = 'data'
-    prop_dir = os.path.join(base_dir, mat_prop)
-    os.makedirs(prop_dir, exist_ok=True)
-
-    df_train[['formula', 'target']].to_csv(os.path.join(prop_dir, 'train.csv'), index=False)
-    df_val[['formula', 'target']].to_csv(os.path.join(prop_dir, 'val.csv'), index=False)
-    df_test[['formula', 'target']].to_csv(os.path.join(prop_dir, 'test.csv'), index=False)
-
-    print(f'✅ Matbench任务 {matbench_task} (fold={fold}) 已保存到: {prop_dir}')
-    return base_dir, mat_prop
 
 
 # ===============================
 # 主程序
 # ===============================
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='CrabNet 训练 + encoder embedding 导出')
+    excel_path = 'filtered.xlsx'  # 输入Excel文件路径
+    mat_prop = 'example_materials_property'  # 材料属性名称
+    classification = False  # 是否为分类任务（False=回归，True=分类）
+    train = True  # 是否训练模型
 
-    # 数据来源
-    parser.add_argument('--source', type=str, default='matbench', choices=['excel', 'matbench'],
-                        help='数据来源：excel 或 matbench')
-
-    # Excel 模式参数
-    parser.add_argument('--excel_path', type=str, default='filtered.xlsx',
-                        help='Excel 输入路径（source=excel 时使用）')
-
-    # Matbench 模式参数
-    parser.add_argument('--matbench_task', type=str, default='matbench_perovskites',
-                        help='Matbench 任务名，例如 matbench_perovskites')
-    parser.add_argument('--fold', type=int, default=0, help='Matbench fold 编号')
-    parser.add_argument('--val_size', type=float, default=0.1, help='从 trainval 切给 val 的比例')
-
-    # 通用参数
-    parser.add_argument('--mat_prop', type=str, default='castelli',
-                        help='本地保存用的数据集名（目录名）')
-    parser.add_argument('--classification', type=str2bool, default=False,
-                        help='是否分类任务')
-    parser.add_argument('--train', type=str2bool, default=True,
-                        help='是否训练模型')
-    parser.add_argument('--pooling', type=str, default='frac_weighted',
-                        choices=['frac_weighted', 'mean'],
-                        help='encoder pooling 方式')
-    parser.add_argument('--epochs', type=int, default=500, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=1, help='batch size')
-
-    args = parser.parse_args()
-
-    # 1) 准备数据
-    if args.source == 'excel':
-        if not args.excel_path.endswith(('.xlsx', '.xls')):
-            raise ValueError("source=excel 时，--excel_path 必须是 xlsx/xls 文件")
+    # 预处理Excel数据
+    if excel_path.endswith(('.xlsx', '.xls')):
         data_dir, mat_prop = preprocess_excel_to_csv(
-            excel_path=args.excel_path,
-            mat_prop=args.mat_prop,
-            test_size=0.2,
-            val_size=args.val_size
+            excel_path,
+            mat_prop,
+            test_size=0.2,  # 测试集比例
+            val_size=0.1  # 验证集比例
         )
     else:
-        data_dir, mat_prop = prepare_matbench_task_to_csv(
-            matbench_task=args.matbench_task,
-            mat_prop=args.mat_prop,   # 推荐 castelli，方便与你现有脚本命名一致
-            fold=args.fold,
-            val_size=args.val_size,
-            seed=RNG_SEED
-        )
+        data_dir = excel_path
 
-    # 2) 训练
-    if args.train:
-        _ = get_model(
-            data_dir=data_dir,
-            mat_prop=mat_prop,
-            classification=args.classification,
-            batch_size=args.batch_size,
-            verbose=True,
-            epochs=args.epochs
-        )
+    # 训练模型
+    if train:
+        model = get_model(data_dir, mat_prop, classification, verbose=True)
 
-    # 3) 评估 + 预测保存
-    cutter = '=' * 53
+    # 打印分隔符和评估结果
+    cutter = '====================================================='
     first = " " * ((len(cutter) - len(mat_prop)) // 2) + " " * int((len(mat_prop) + 1) % 2)
     last = " " * ((len(cutter) - len(mat_prop)) // 2)
     print(f'{first}{mat_prop}{last}')
 
+    # 评估训练集
     print('\n训练集性能:')
-    _, _ = save_results(data_dir, mat_prop, args.classification, 'train.csv', verbose=False)
-
+    model_train, metrics_train = save_results(data_dir, mat_prop, classification,
+                                              'train.csv', verbose=False)
+    # 评估验证集
     print('\n验证集性能:')
-    _, _ = save_results(data_dir, mat_prop, args.classification, 'val.csv', verbose=False)
-
+    model_val, metrics_val = save_results(data_dir, mat_prop, classification,
+                                          'val.csv', verbose=False)
+    # 评估测试集
     print('\n测试集性能:')
-    _, _ = save_results(data_dir, mat_prop, args.classification, 'test.csv', verbose=False)
-
-    # 4) 导出 encoder 向量
+    model_test, metrics_test = save_results(data_dir, mat_prop, classification,
+                                            'test.csv', verbose=False)
     print('\n导出 encoder composition 向量:')
-    train_emb_csv = save_encoder_embeddings_csv(
-        data_dir, mat_prop, args.classification, 'train.csv',
-        pooling=args.pooling, verbose=False
-    )
-    val_emb_csv = save_encoder_embeddings_csv(
-        data_dir, mat_prop, args.classification, 'val.csv',
-        pooling=args.pooling, verbose=False
-    )
-    test_emb_csv = save_encoder_embeddings_csv(
-        data_dir, mat_prop, args.classification, 'test.csv',
-        pooling=args.pooling, verbose=False
-    )
+    train_emb_csv = save_encoder_embeddings_csv(data_dir, mat_prop, classification,
+                                                'train.csv', pooling='frac_weighted', verbose=False)
+    val_emb_csv = save_encoder_embeddings_csv(data_dir, mat_prop, classification,
+                                              'val.csv', pooling='frac_weighted', verbose=False)
+    test_emb_csv = save_encoder_embeddings_csv(data_dir, mat_prop, classification,
+                                               'test.csv', pooling='frac_weighted', verbose=False)
 
-    # 5) 合并 embedding
+    # 合并 train/val/test 三个 embedding CSV，并导出为 Excel
     print('\n合并 embedding CSV 并导出 Excel:')
-    merge_embedding_csvs_to_excel(
-        [train_emb_csv, val_emb_csv, test_emb_csv],
-        mat_prop,
-        pooling=args.pooling
-    )
+    merge_embedding_csvs_to_excel([train_emb_csv, val_emb_csv, test_emb_csv],
+                                  mat_prop,
+                                  pooling='frac_weighted')
