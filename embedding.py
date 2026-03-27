@@ -313,6 +313,9 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
         raise ValueError('formula 列在清洗后没有可用的合法化学式。')
     # ========== 目标列 ==========
     target_col = df.columns[1]
+    if target_col != 'target':
+        df = df.rename(columns={target_col: 'target'})
+        target_col = 'target'
     df[target_col] = pd.to_numeric(df[target_col], errors='coerce')
     df = df[np.isfinite(df[target_col])].copy()
     if df.empty:
