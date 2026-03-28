@@ -15,18 +15,13 @@ from sklearn.model_selection import train_test_split
 from crabnet.kingcrab import CrabNet
 from crabnet.model import Model
 from utils.get_compute_device import get_compute_device
-from utils.composition import _element_composition, CompositionError
+
 # 全局设置
 compute_device = get_compute_device(prefer_last=True)
 RNG_SEED = 42
 torch.manual_seed(RNG_SEED)
 np.random.seed(RNG_SEED)
-def _is_valid_formula_global(formula):
-    try:
-        _element_composition(str(formula))
-        return True
-    except (CompositionError, ValueError, TypeError):
-        return False
+
 
 # ===============================
 # 替换后的化学式分数转小数核心函数（更健壮）
@@ -78,20 +73,6 @@ def get_model(data_dir, mat_prop, classification=False, batch_size=None,
     train_data = f'{data_dir}/{mat_prop}/train.csv'
     val_data = f'{data_dir}/{mat_prop}/val.csv'
 
-    def _sanitize_formula_csv(csv_path):
-        df_csv = pd.read_csv(csv_path)
-        if 'formula' not in df_csv.columns:
-            return
-        valid_mask = df_csv['formula'].astype(str).map(
-            lambda f: _is_valid_formula_global(f)
-        )
-        if not valid_mask.all():
-            df_csv = df_csv[valid_mask].reset_index(drop=True)
-            df_csv.to_csv(csv_path, index=False)
-            print(f'⚠️ 已清理非法化学式: {csv_path} -> 保留 {len(df_csv)} 条')
-
-    _sanitize_formula_csv(train_data)
-    _sanitize_formula_csv(val_data)
     # 检查验证集是否存在（修正原代码异常捕获无效的问题）
     if not os.path.exists(val_data):
         raise FileNotFoundError(
@@ -308,37 +289,25 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
         .str.replace(r'\s+|\u200b', '', regex=True)
         .apply(frac_to_decimal_in_formula)
     )
-    df = df[df['formula'].map(_is_valid_formula_global)].copy()
-    if df.empty:
-        raise ValueError('formula 列在清洗后没有可用的合法化学式。')
+
     # ========== 目标列 ==========
     target_col = df.columns[1]
-    if target_col != 'target':
-        df = df.rename(columns={target_col: 'target'})
-        target_col = 'target'
-    df[target_col] = pd.to_numeric(df[target_col], errors='coerce')
-    df = df[np.isfinite(df[target_col])].copy()
-    if df.empty:
-        raise ValueError(f'目标列 {target_col} 在清洗后没有可用的有限数值。')
-    df[target_col] = pd.to_numeric(df[target_col], errors='coerce')
-    df = df[np.isfinite(df[target_col])].copy()
-    if df.empty:
-        raise ValueError(f'目标列 {target_col} 在清洗后没有可用的有限数值。')
+
     # ========== 按目标分箱（只用于分层） ==========
-    # 使用分位数分箱，兼容包含负值/较宽范围的目标分布（如 matbench_perovskites）
-    df["y_bin"] = pd.qcut(df[target_col], q=3, labels=False, duplicates='drop')
+    bins = [0, 1.0, 2.0, np.inf]
+    df["y_bin"] = pd.cut(
+        df[target_col],
+        bins=bins,
+        labels=[0, 1, 2],
+        include_lowest=True
+    )
 
-    def _can_stratify(y_bin):
-        vc = y_bin.value_counts()
-        return y_bin.nunique() >= 2 and (vc.min() >= 2)
-
-    stratify_all = df["y_bin"] if _can_stratify(df["y_bin"]) else None
     # ========== 第一次切分：train_val / test（分层） ==========
     train_val_df, test_df = train_test_split(
         df,
         test_size=test_size,
         random_state=RNG_SEED,
-        stratify=stratify_all
+        stratify=df["y_bin"]
     )
 
     # ========== 第二次切分：train / val（分层） ==========
@@ -347,7 +316,7 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
         train_val_df,
         test_size=val_relative_size,
         random_state=RNG_SEED,
-        stratify=train_val_df["y_bin"] if _can_stratify(train_val_df["y_bin"]) else None
+        stratify=train_val_df["y_bin"]
     )
 
     # ========== 删除临时分箱列 ==========
@@ -372,65 +341,7 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
 # 主程序
 # ===============================
 if __name__ == '__main__':
-    from matbench.bench import MatbenchBenchmark
-
-    # 从 Matbench 下载钙钛矿数据集，并转换为当前流程兼容的 Excel 输入
-    task_name = 'matbench_perovskites'
-    downloaded_excel_path = f'{task_name}.xlsx'
-    mb = MatbenchBenchmark(autoload=False, subset=[task_name])
-    task = next(iter(mb.tasks))
-    task.load()
-    try:
-        train_inputs, train_targets = task.get_train_and_val_data(fold=0)
-    except TypeError:
-        # 兼容旧版 matbench：仅支持位置参数
-        train_inputs, train_targets = task.get_train_and_val_data(0)
-
-
-    def _to_formula(v):
-        # Structure/Composition 对象优先转为 reduced_formula
-        if hasattr(v, 'composition') and hasattr(v.composition, 'reduced_formula'):
-            return v.composition.reduced_formula
-        if hasattr(v, 'reduced_formula'):
-            return v.reduced_formula
-        s = str(v).strip()
-        # 兼容 "Full Formula (Ca4 Ti4 O12)" 这类字符串
-        m = re.search(r'Full Formula \(([^)]+)\)', s)
-        if m:
-            return re.sub(r'\s+', '', m.group(1))
-        return s
-
-
-    # 兼容 train_inputs 是 DataFrame/Series/array 的不同返回形式
-    if isinstance(train_inputs, pd.DataFrame):
-        candidate_col = None
-        for col in train_inputs.columns:
-            col_str = train_inputs[col].astype(str)
-            if col_str.str.contains(r'[A-Za-z]').mean() > 0.8:
-                candidate_col = col
-                break
-        if candidate_col is None:
-            candidate_col = train_inputs.columns[0]
-        formula_series = train_inputs[candidate_col].map(_to_formula)
-    else:
-        formula_series = pd.Series(train_inputs).map(_to_formula)
-
-    target_series = pd.Series(train_targets)
-    if len(target_series) != len(formula_series):
-        target_series = target_series.reset_index(drop=True)
-        formula_series = formula_series.reset_index(drop=True)
-
-    perovskite_df = pd.DataFrame({
-        'formula': formula_series.astype(str),
-        task.metadata.target: target_series.values
-    })
-    # 去除明显不是化学式的输入（例如纯数字索引或结构描述文本）
-    perovskite_df['formula'] = perovskite_df['formula'].str.replace(r'\s+', '', regex=True)
-    valid_formula_mask = perovskite_df['formula'].str.match(r'^([A-Z][a-z]?[0-9]*\.?[0-9]*)+$')
-    perovskite_df = perovskite_df[valid_formula_mask].reset_index(drop=True)
-    perovskite_df.to_excel(downloaded_excel_path, index=False)
-
-    excel_path = downloaded_excel_path  # 输入Excel文件路径（由 Matbench 数据生成）
+    excel_path = 'filtered.xlsx'  # 输入Excel文件路径
     mat_prop = 'example_materials_property'  # 材料属性名称
     classification = False  # 是否为分类任务（False=回归，True=分类）
     train = True  # 是否训练模型
