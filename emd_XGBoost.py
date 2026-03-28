@@ -23,46 +23,64 @@ df = data[feature_cols + ['target']].copy()
 # 为兼容旧代码，把 target 改名为 Rp
 df.rename(columns={'target': 'Rp'}, inplace=True)
 
-# =========================
-# ★ 2. 构造 Rp 分箱（仅用于分层）
-# =========================
-rp = df['Rp'].values
 
-rp_bins = pd.cut(
-    rp,
-    bins=[-np.inf, 1.0, 2.0, np.inf],
-    labels=[0, 1, 2]
-)
+def _can_stratify(y_bin):
+    vc = y_bin.value_counts(dropna=False)
+    return y_bin.nunique(dropna=True) >= 2 and len(vc) > 0 and (vc.min() >= 2)
 
-# =========================
-# ★ 3. 第一次分层拆分：Test (20%)
-# =========================
-remain_data, test_data, \
-remain_formula, test_formula, \
-remain_bins, test_bins = train_test_split(
-    df,
-    formulas,
-    rp_bins,
-    test_size=0.2,
-    random_state=42,
-    stratify=rp_bins
-)
 
-# =========================
-# ★ 4. 第二次分层拆分：Val (10%) + Train (70%)
-# =========================
-val_relative_size = 0.1 / 0.8  # 0.125
+def _group_split_indices(formula_series, target_series, test_size, random_state):
+    grouped = pd.DataFrame({
+        'formula': formula_series,
+        'target': target_series
+    }).groupby('formula', as_index=False)['target'].mean()
+    grouped['y_bin'] = pd.qcut(grouped['target'], q=3, labels=False, duplicates='drop')
+    stratify = grouped['y_bin'] if _can_stratify(grouped['y_bin']) else None
+    train_groups, test_groups = train_test_split(
+        grouped['formula'],
+        test_size=test_size,
+        random_state=random_state,
+        stratify=stratify
+    )
+    train_groups = set(train_groups.tolist())
+    test_groups = set(test_groups.tolist())
+    train_mask = pd.Series(formula_series).isin(train_groups).values
+    test_mask = pd.Series(formula_series).isin(test_groups).values
+    return train_mask, test_mask
 
-train_data, val_data, \
-train_formula, val_formula, \
-train_bins, val_bins = train_test_split(
-    remain_data,
-    remain_formula,
-    remain_bins,
-    test_size=val_relative_size,
-    random_state=42,
-    stratify=remain_bins
-)
+dataset_col = data['dataset'].astype(str).str.lower() if 'dataset' in data.columns else None
+has_explicit_split = dataset_col is not None and {'train', 'val', 'test'}.issubset(set(dataset_col))
+
+if has_explicit_split:
+    train_mask = dataset_col == 'train'
+    val_mask = dataset_col == 'val'
+    test_mask = dataset_col == 'test'
+
+    train_data = df.loc[train_mask].reset_index(drop=True)
+    val_data = df.loc[val_mask].reset_index(drop=True)
+    test_data = df.loc[test_mask].reset_index(drop=True)
+
+    train_formula = formulas[train_mask]
+    val_formula = formulas[val_mask]
+    test_formula = formulas[test_mask]
+else:
+    remain_mask, test_mask = _group_split_indices(formulas, df['Rp'].values, 0.2, 42)
+    remain_data = df.loc[remain_mask].reset_index(drop=True)
+    test_data = df.loc[test_mask].reset_index(drop=True)
+    remain_formula = formulas[remain_mask]
+    test_formula = formulas[test_mask]
+
+    val_relative_size = 0.1 / 0.8  # 0.125
+    train_mask_inner, val_mask = _group_split_indices(
+        remain_formula,
+        remain_data['Rp'].values,
+        val_relative_size,
+        42
+    )
+    train_data = remain_data.loc[train_mask_inner].reset_index(drop=True)
+    val_data = remain_data.loc[val_mask].reset_index(drop=True)
+    train_formula = remain_formula[train_mask_inner]
+    val_formula = remain_formula[val_mask]
 
 TrainData, ValData, TestData = train_data, val_data, test_data
 Train_formula, Val_formula, Test_formula = train_formula, val_formula, test_formula
