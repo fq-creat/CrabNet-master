@@ -15,18 +15,13 @@ from sklearn.model_selection import train_test_split
 from crabnet.kingcrab import CrabNet
 from crabnet.model import Model
 from utils.get_compute_device import get_compute_device
-from utils.composition import _element_composition, CompositionError
+
 # 全局设置
 compute_device = get_compute_device(prefer_last=True)
 RNG_SEED = 42
 torch.manual_seed(RNG_SEED)
 np.random.seed(RNG_SEED)
-def _is_valid_formula_global(formula):
-    try:
-        _element_composition(str(formula))
-        return True
-    except (CompositionError, ValueError, TypeError):
-        return False
+
 
 # ===============================
 # 替换后的化学式分数转小数核心函数（更健壮）
@@ -78,20 +73,6 @@ def get_model(data_dir, mat_prop, classification=False, batch_size=None,
     train_data = f'{data_dir}/{mat_prop}/train.csv'
     val_data = f'{data_dir}/{mat_prop}/val.csv'
 
-    def _sanitize_formula_csv(csv_path):
-        df_csv = pd.read_csv(csv_path)
-        if 'formula' not in df_csv.columns:
-            return
-        valid_mask = df_csv['formula'].astype(str).map(
-            lambda f: _is_valid_formula_global(f)
-        )
-        if not valid_mask.all():
-            df_csv = df_csv[valid_mask].reset_index(drop=True)
-            df_csv.to_csv(csv_path, index=False)
-            print(f'⚠️ 已清理非法化学式: {csv_path} -> 保留 {len(df_csv)} 条')
-
-    _sanitize_formula_csv(train_data)
-    _sanitize_formula_csv(val_data)
     # 检查验证集是否存在（修正原代码异常捕获无效的问题）
     if not os.path.exists(val_data):
         raise FileNotFoundError(
@@ -308,37 +289,25 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
         .str.replace(r'\s+|\u200b', '', regex=True)
         .apply(frac_to_decimal_in_formula)
     )
-    df = df[df['formula'].map(_is_valid_formula_global)].copy()
-    if df.empty:
-        raise ValueError('formula 列在清洗后没有可用的合法化学式。')
+
     # ========== 目标列 ==========
     target_col = df.columns[1]
-    if target_col != 'target':
-        df = df.rename(columns={target_col: 'target'})
-        target_col = 'target'
-    df[target_col] = pd.to_numeric(df[target_col], errors='coerce')
-    df = df[np.isfinite(df[target_col])].copy()
-    if df.empty:
-        raise ValueError(f'目标列 {target_col} 在清洗后没有可用的有限数值。')
-    df[target_col] = pd.to_numeric(df[target_col], errors='coerce')
-    df = df[np.isfinite(df[target_col])].copy()
-    if df.empty:
-        raise ValueError(f'目标列 {target_col} 在清洗后没有可用的有限数值。')
+
     # ========== 按目标分箱（只用于分层） ==========
-    # 使用分位数分箱，兼容包含负值/较宽范围的目标分布（如 matbench_perovskites）
-    df["y_bin"] = pd.qcut(df[target_col], q=3, labels=False, duplicates='drop')
+    bins = [0, 1.0, 2.0, np.inf]
+    df["y_bin"] = pd.cut(
+        df[target_col],
+        bins=bins,
+        labels=[0, 1, 2],
+        include_lowest=True
+    )
 
-    def _can_stratify(y_bin):
-        vc = y_bin.value_counts()
-        return y_bin.nunique() >= 2 and (vc.min() >= 2)
-
-    stratify_all = df["y_bin"] if _can_stratify(df["y_bin"]) else None
     # ========== 第一次切分：train_val / test（分层） ==========
     train_val_df, test_df = train_test_split(
         df,
         test_size=test_size,
         random_state=RNG_SEED,
-        stratify=stratify_all
+        stratify=df["y_bin"]
     )
 
     # ========== 第二次切分：train / val（分层） ==========
@@ -347,7 +316,7 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
         train_val_df,
         test_size=val_relative_size,
         random_state=RNG_SEED,
-        stratify=train_val_df["y_bin"] if _can_stratify(train_val_df["y_bin"]) else None
+        stratify=train_val_df["y_bin"]
     )
 
     # ========== 删除临时分箱列 ==========
@@ -365,159 +334,61 @@ def preprocess_excel_to_csv(excel_path, mat_prop, test_size=0.2, val_size=0.1):
     test_df.to_csv(os.path.join(prop_dir, 'test.csv'), index=False)
 
     return base_dir, mat_prop
-def preprocess_matbench_fold_to_csv(train_df, test_df, mat_prop, fold, val_size=0.1):
-    # Matbench 标准流程：test 直接使用 Matbench fold test，仅从 train 中切分 val
-    def _clean_split_df(df):
-        df = df.copy()
-        df['formula'] = (
-            df['formula']
-            .astype(str)
-            .str.replace(r'\s+|\u200b', '', regex=True)
-            .apply(frac_to_decimal_in_formula)
-        )
-        df = df[df['formula'].map(_is_valid_formula_global)].copy()
-        if df.empty:
-            raise ValueError('formula 列在清洗后没有可用的合法化学式。')
-        target_col = df.columns[1]
-        if target_col != 'target':
-            df = df.rename(columns={target_col: 'target'})
-        df['target'] = pd.to_numeric(df['target'], errors='coerce')
-        df = df[np.isfinite(df['target'])].copy()
-        if df.empty:
-            raise ValueError('target 列在清洗后没有可用的有限数值。')
-        return df
 
-    train_df = _clean_split_df(train_df)
-    test_df = _clean_split_df(test_df)
-
-    train_df["y_bin"] = pd.qcut(train_df['target'], q=3, labels=False, duplicates='drop')
-
-    def _can_stratify(y_bin):
-        vc = y_bin.value_counts()
-        return y_bin.nunique() >= 2 and (vc.min() >= 2)
-
-    train_df, val_df = train_test_split(
-        train_df,
-        test_size=val_size,
-        random_state=RNG_SEED,
-        stratify=train_df["y_bin"] if _can_stratify(train_df["y_bin"]) else None
-    )
-    for split_df in [train_df, val_df]:
-        split_df.drop(columns=["y_bin"], inplace=True)
-
-    base_dir = 'data'
-    fold_mat_prop = f'{mat_prop}_cv{fold}'
-    prop_dir = os.path.join(base_dir, fold_mat_prop)
-    os.makedirs(prop_dir, exist_ok=True)
-
-    train_df.to_csv(os.path.join(prop_dir, 'train.csv'), index=False)
-    val_df.to_csv(os.path.join(prop_dir, 'val.csv'), index=False)
-    test_df.to_csv(os.path.join(prop_dir, 'test.csv'), index=False)
-
-    return base_dir, fold_mat_prop
 
 
 # ===============================
 # 主程序
 # ===============================
 if __name__ == '__main__':
-    from matbench.bench import MatbenchBenchmark
-
-    # 从 Matbench 下载钙钛矿数据集，并按标准 5-fold 逐 fold 训练/评估
-    task_name = 'matbench_perovskites'
-    mb = MatbenchBenchmark(autoload=False, subset=[task_name])
-    task = next(iter(mb.tasks))
-    task.load()
-
-
-    def _to_formula(v):
-        # Structure/Composition 对象优先转为 reduced_formula
-        if hasattr(v, 'composition') and hasattr(v.composition, 'reduced_formula'):
-            return v.composition.reduced_formula
-        if hasattr(v, 'reduced_formula'):
-            return v.reduced_formula
-        s = str(v).strip()
-        # 兼容 "Full Formula (Ca4 Ti4 O12)" 这类字符串
-        m = re.search(r'Full Formula \(([^)]+)\)', s)
-        if m:
-            return re.sub(r'\s+', '', m.group(1))
-        return s
+    excel_path = 'filtered.xlsx'  # 输入Excel文件路径
     mat_prop = 'example_materials_property'  # 材料属性名称
     classification = False  # 是否为分类任务（False=回归，True=分类）
     train = True  # 是否训练模型
 
-    for fold in task.folds:
-        # 每个 fold：直接使用 Matbench train/test，再从 train 划分少量 val
-        try:
-            train_inputs, train_targets = task.get_train_and_val_data(fold=fold)
-            test_inputs, test_targets = task.get_test_data(fold=fold, include_target=True)
-        except TypeError:
-            # 兼容旧版 matbench：仅支持位置参数
-            train_inputs, train_targets = task.get_train_and_val_data(fold)
-            test_inputs, test_targets = task.get_test_data(fold, True)
+    # 预处理Excel数据
+    if excel_path.endswith(('.xlsx', '.xls')):
+        data_dir, mat_prop = preprocess_excel_to_csv(
+            excel_path,
+            mat_prop,
+            test_size=0.2,  # 测试集比例
+            val_size=0.1  # 验证集比例
+        )
+    else:
+        data_dir = excel_path
 
+    # 训练模型
+    if train:
+        model = get_model(data_dir, mat_prop, classification, verbose=True)
 
-        # 兼容 train/test 输入格式（DataFrame/Series/array）
-        def _inputs_to_formula_series(inputs):
-            if isinstance(inputs, pd.DataFrame):
-                candidate_col = None
-                for col in inputs.columns:
-                    col_str = inputs[col].astype(str)
-                    if col_str.str.contains(r'[A-Za-z]').mean() > 0.8:
-                        candidate_col = col
-                        break
-                if candidate_col is None:
-                    candidate_col = inputs.columns[0]
-                return inputs[candidate_col].map(_to_formula)
-            return pd.Series(inputs).map(_to_formula)
+    # 打印分隔符和评估结果
+    cutter = '====================================================='
+    first = " " * ((len(cutter) - len(mat_prop)) // 2) + " " * int((len(mat_prop) + 1) % 2)
+    last = " " * ((len(cutter) - len(mat_prop)) // 2)
+    print(f'{first}{mat_prop}{last}')
 
+    # 评估训练集
+    print('\n训练集性能:')
+    model_train, metrics_train = save_results(data_dir, mat_prop, classification,
+                                              'train.csv', verbose=False)
+    # 评估验证集
+    print('\n验证集性能:')
+    model_val, metrics_val = save_results(data_dir, mat_prop, classification,
+                                          'val.csv', verbose=False)
+    # 评估测试集
+    print('\n测试集性能:')
+    model_test, metrics_test = save_results(data_dir, mat_prop, classification,
+                                            'test.csv', verbose=False)
+    print('\n导出 encoder composition 向量:')
+    train_emb_csv = save_encoder_embeddings_csv(data_dir, mat_prop, classification,
+                                                'train.csv', pooling='frac_weighted', verbose=False)
+    val_emb_csv = save_encoder_embeddings_csv(data_dir, mat_prop, classification,
+                                              'val.csv', pooling='frac_weighted', verbose=False)
+    test_emb_csv = save_encoder_embeddings_csv(data_dir, mat_prop, classification,
+                                               'test.csv', pooling='frac_weighted', verbose=False)
 
-        train_formula_series = _inputs_to_formula_series(train_inputs)
-        test_formula_series = _inputs_to_formula_series(test_inputs)
-        train_target_series = pd.Series(train_targets).reset_index(drop=True)
-        test_target_series = pd.Series(test_targets).reset_index(drop=True)
-        train_formula_series = train_formula_series.reset_index(drop=True)
-        test_formula_series = test_formula_series.reset_index(drop=True)
-
-        train_df = pd.DataFrame({'formula': train_formula_series.astype(str), 'target': train_target_series.values})
-        test_df = pd.DataFrame({'formula': test_formula_series.astype(str), 'target': test_target_series.values})
-
-        data_dir, fold_mat_prop = preprocess_matbench_fold_to_csv(
-            train_df, test_df, mat_prop, fold=fold, val_size=0.1)
-        # 训练模型
-        if train:
-            model = get_model(data_dir, fold_mat_prop, classification, verbose=True)
-
-        # 打印分隔符和评估结果
-        cutter = '====================================================='
-        first = " " * ((len(cutter) - len(fold_mat_prop)) // 2) + " " * int((len(fold_mat_prop) + 1) % 2)
-        last = " " * ((len(cutter) - len(fold_mat_prop)) // 2)
-        print(f'{first}{fold_mat_prop}{last}')
-
-        # 评估训练集
-        print('\n训练集性能:')
-        model_train, metrics_train = save_results(data_dir, fold_mat_prop, classification,
-                                                  'train.csv', verbose=False)
-        # 评估验证集
-        print('\n验证集性能:')
-        model_val, metrics_val = save_results(data_dir, fold_mat_prop, classification,
-                                              'val.csv', verbose=False)
-        # 评估测试集
-        print('\n测试集性能:')
-        model_test, metrics_test = save_results(data_dir, fold_mat_prop, classification,
-                                                'test.csv', verbose=False)
-        print('\n导出 encoder composition 向量:')
-        train_emb_csv = save_encoder_embeddings_csv(data_dir, fold_mat_prop, classification,
-                                                    'train.csv', pooling='frac_weighted', verbose=False)
-        val_emb_csv = save_encoder_embeddings_csv(data_dir, fold_mat_prop, classification,
-                                                  'val.csv', pooling='frac_weighted', verbose=False)
-        test_emb_csv = save_encoder_embeddings_csv(data_dir, fold_mat_prop, classification,
-                                                   'test.csv', pooling='frac_weighted', verbose=False)
-
-        # 合并 train/val/test 三个 embedding CSV，并导出为 Excel
-        print('\n合并 embedding CSV 并导出 Excel:')
-        merge_embedding_csvs_to_excel([train_emb_csv, val_emb_csv, test_emb_csv],
-                                      fold_mat_prop,
-                                      pooling='frac_weighted')
-
-
+    # 合并 train/val/test 三个 embedding CSV，并导出为 Excel
+    print('\n合并 embedding CSV 并导出 Excel:')
+    merge_embedding_csvs_to_excel([train_emb_csv, val_emb_csv, test_emb_csv],
+                                  mat_prop,
+                                  pooling='frac_weighted')
