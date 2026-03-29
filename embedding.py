@@ -83,7 +83,7 @@ def get_model(data_dir, mat_prop, classification=False, batch_size=None,
     # data_size = pd.read_csv(train_data).shape[0]
     # batch_size = 2 ** round(np.log2(data_size) - 4)
     # batch_size = max(2 ** 7, min(batch_size, 2 ** 12))  # 简化边界判断
-    FIXED_BATCH_SIZE =128
+    FIXED_BATCH_SIZE =16
     batch_size = FIXED_BATCH_SIZE
     # 加载训练数据
     model.load_data(train_data, batch_size=batch_size, train=True)
@@ -155,7 +155,7 @@ def load_model(data_dir, mat_prop, classification, file_name, verbose=True):
 
     # 加载待预测数据
     data = f'{data_dir}/{mat_prop}/{file_name}'
-    model.load_data(data, batch_size=128, train=False)
+    model.load_data(data, batch_size=16, train=False)
     return model
 
 
@@ -264,7 +264,6 @@ def merge_embedding_csvs_to_excel(csv_paths, mat_prop, pooling='frac_weighted'):
         merged_parts.append(df)
 
     merged_df = pd.concat(merged_parts, ignore_index=True)
-
     save_dir = 'model_embeddings'
     os.makedirs(save_dir, exist_ok=True)
     merged_csv_path = os.path.join(save_dir, f'{mat_prop}_all_encoder_{pooling}.csv')
